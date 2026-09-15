@@ -4,37 +4,45 @@ import json
 import asyncio
 import urllib.parse
 from datetime import datetime
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import gradio as gr
 from groq import Groq
 import httpx
 
-# 1. Khởi tạo Groq Client (Lấy key an toàn từ biến môi trường)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=GROQ_API_KEY)
+# 1. Khởi tạo FastAPI app
+app = FastAPI()
+
+# 2. Khởi tạo Groq Client
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+def get_groq_client():
+    key = os.getenv("GROQ_API_KEY", GROQ_API_KEY)
+    if not key:
+        return None
+    return Groq(api_key=key)
 
 def detect_available_model():
+    client = get_groq_client()
+    if not client:
+        return "llama-3.1-8b-instant"
     try:
         models = client.models.list()
         model_ids = [m.id for m in models.data]
         preferred_models = [
+            "llama-3.1-8b-instant",
             "openai/gpt-oss-20b",
-            "openai/gpt-oss-120b",
-            "qwen/qwen3.8-27b",
-            "llama-3.1-8b-instant"
+            "qwen/qwen3.8-27b"
         ]
         for pref in preferred_models:
             if pref in model_ids:
                 return pref
         if model_ids:
             return model_ids[0]
-    except Exception:
-        pass
-    return "openai/gpt-oss-20b"
+    except Exception as e:
+        print(f"Error detecting model: {e}")
+    return "llama-3.1-8b-instant"
 
-SELECTED_MODEL = detect_available_model()
-
-# 2. Trích xuất địa điểm & Gọi API Thời tiết
+# 3. Trích xuất địa điểm & Gọi API Thời tiết
 def extract_location_query(prompt: str) -> str:
     text = prompt.strip()
     patterns_to_remove = [
@@ -89,10 +97,14 @@ async def get_dynamic_weather(prompt: str) -> str:
 
     return f"Thời tiết tại {location_name}: Nhiệt độ khoảng 27°C, trời có mây."
 
-# 3. Trí tuệ nhân tạo Groq LLM
+# 4. Trí tuệ nhân tạo Groq LLM
 async def get_groq_response(prompt: str) -> str:
     if not prompt or not prompt.strip():
         return "Xin chào! Tôi có thể giúp gì cho bạn?"
+
+    client = get_groq_client()
+    if not client:
+        return "Lỗi: Chưa cấu hình GROQ_API_KEY trên Render Environment Variables."
 
     now = datetime.now()
     days_vn = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
@@ -100,6 +112,7 @@ async def get_groq_response(prompt: str) -> str:
     current_time_str = f"{current_day}, ngày {now.strftime('%d/%m/%Y')}, lúc {now.strftime('%H:%M:%S')}"
     
     weather_info = await get_dynamic_weather(prompt)
+    selected_model = detect_available_model()
 
     system_instruction = f"""Bạn là VietBot AI - Trợ lý thông minh bằng tiếng Việt.
 Thời gian hiện tại: {current_time_str}.
@@ -108,13 +121,12 @@ Thời gian hiện tại: {current_time_str}.
 {weather_info}
 
 Nhiệm vụ:
-1. Bạn ĐÃ CÓ sẵn dữ liệu thời tiết thực tế ở trên. Hãy dùng dữ liệu này để trả lời người dùng.
-2. Tuyệt đối KHÔNG ĐƯỢC trả lời "không có dữ liệu" hoặc "chỉ có dữ liệu Phúc Yên".
-3. Trả lời ngắn gọn, tự nhiên, chính xác theo đúng dữ liệu được cung cấp."""
+1. Sử dụng thông tin thời tiết thực tế ở trên để trả lời người dùng.
+2. Trả lời ngắn gọn, tự nhiên, chính xác."""
 
     def _call_groq():
         completion = client.chat.completions.create(
-            model=SELECTED_MODEL,
+            model=selected_model,
             messages=[
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt}
@@ -124,21 +136,22 @@ Nhiệm vụ:
         )
         return completion.choices[0].message.content
 
-    return await asyncio.to_thread(_call_groq)
+    try:
+        return await asyncio.to_thread(_call_groq)
+    except Exception as e:
+        return f"Lỗi xử lý AI: {str(e)}"
 
-# 4. Giao diện Chat Gradio
+# 5. Giao diện Chat Gradio
 async def chat_fn(message, history):
     return await get_groq_response(message)
 
 demo = gr.ChatInterface(
     fn=chat_fn,
     title="🤖 VietBot AI Platform",
-    description="Server AI hỗ trợ xử lý giọng nói & nhắn tin cho Mobile App."
+    description="Server AI hỗ trợ xử lý giọng nói & nhắn tin cho Mobile App / ESP32."
 )
 
-# 5. Đăng ký FastAPI app & tuyến WebSocket cho Uvicorn
-app = demo.app
-
+# 6. WebSocket endpoint
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
@@ -159,3 +172,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             await websocket.send_text(ai_reply)
     except WebSocketDisconnect:
         pass
+
+# Gắn Gradio app vào FastAPI root
+app = gr.mount_gradio_app(app, demo, path="/")
